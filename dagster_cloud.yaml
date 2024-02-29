@@ -1,0 +1,4 @@
+locations:
+  - location_name: Encalveid-Data-Pipeline
+    code_source:
+      module_name: enclaveid_data_pipeline
