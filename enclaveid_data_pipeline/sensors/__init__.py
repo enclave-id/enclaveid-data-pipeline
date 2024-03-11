@@ -27,6 +27,7 @@ def users_sensor(context: SensorEvaluationContext) -> SensorResult | SkipReason:
     dirs_to_delete = current_state - all_dirs
 
     if len(dirs_to_add) + len(dirs_to_delete) > 0:
+        # TODO: Also return run requests because eager AMPs don't do backfills.
         return SensorResult(
             cursor=str(all_dirs),
             dynamic_partitions_requests=[
