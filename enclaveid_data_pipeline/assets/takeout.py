@@ -49,10 +49,13 @@ class TakeoutConfig(Config):
 def parsed_takeout(
     context: AssetExecutionContext, config: TakeoutConfig
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Parses the raw Takeout data an splits it into two sets based on recency.
+    """Parses the raw Takeout data and splits it into two sets based on recency.
     The exact threshold is controlled by the TakeoutConfig.threshold parameter
     (-3mo by default).
     """
+    if not config.threshold.startswith("-"):
+        raise ValueError("the `threshold` should always start with a `-` sign.")
+
     f = PRODUCTION_STORAGE_BUCKET / context.partition_key / "MyActivity.json"
 
     # TODO: Temporarily using Pandas to read the JSON because Polars doesn't
