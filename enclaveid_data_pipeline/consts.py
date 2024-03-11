@@ -15,12 +15,13 @@ DEPLOYMENT_TYPE = get_environment()
 
 PRODUCTION_STORAGE_BUCKET: UPath = {
     "LOCAL": UPath(__file__).parent.parent / "data",
-    "BRANCH": UPath("my-staging-bucket"),
-    "PROD": UPath("my-production-bucket"),
+    # TODO: Should we also have a staging bucket for user data?
+    "BRANCH": UPath("az://enclaveid-production-bucket/"),
+    "PROD": UPath("az://enclaveid-production-bucket/"),
 }[DEPLOYMENT_TYPE]
 
 DAGSTER_STORAGE_BUCKET = {
     "LOCAL": UPath("/tmp/dagster_data"),
-    "BRANCH": UPath("my-dagster-staging-bucket"),
-    "PROD": UPath("my-dagster-prod-bucket"),
+    "BRANCH": UPath("az://enclaveid-dagster-staging-bucket/"),
+    "PROD": UPath("az://enclaveid-dagster-prod-bucket/"),
 }[DEPLOYMENT_TYPE]
