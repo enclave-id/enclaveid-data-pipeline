@@ -1,5 +1,6 @@
 from textwrap import dedent
 
+import pandas as pd
 import polars as pl
 from dagster import (
     AssetExecutionContext,
@@ -54,7 +55,9 @@ def parsed_takeout(
     """
     f = PRODUCTION_STORAGE_BUCKET / context.partition_key / "MyActivity.json"
 
-    df = pl.read_json(f, schema_overrides={"time": pl.Datetime}).select(
+    # TODO: Temporarily using Pandas to read the JSON because Polars doesn't
+    # play well with UPath. Will fix this later.
+    df = pl.from_pandas(pd.read_json(f), schema_overrides={"time": pl.Datetime}).select(
         pl.all().exclude("time"),
         timestamp=pl.col("time"),
         date=pl.col("time").dt.date(),
