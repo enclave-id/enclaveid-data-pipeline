@@ -1,3 +1,6 @@
+# TODO: Temporary. Remove this.
+enclaveid-notebooks/
+
 # Data folder
 data/
 *.csv
