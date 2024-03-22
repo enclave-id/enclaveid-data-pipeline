@@ -17,6 +17,7 @@ SUMMARY_PROMPT = dedent("""
     - `time_start`: The start time of the first search in the group.
     - `time_end`: The end time of the last search in the group.
     - `description`: A detailed account of the searches and site visits, enriched with inferred user intent and additional insights into the topic.
+    - `interests`: A list of keywords representing the user's interests based on the searches.
 
     Each `description` should not only recap the searches but also offer a deeper understanding of what the user might be seeking or the broader context of their inquiries. Group searches based on thematic relevance and timing. 
 
@@ -26,6 +27,7 @@ SUMMARY_PROMPT = dedent("""
     "time_start": "HH:MM",
     "time_end": "HH:MM",
     "description": "Elaborate on what the user did and why, based on the search terms and visited pages.",
+    "interests": ["keyword1", "keyword2"]
     }
     
     Here is a list of searches:
@@ -34,6 +36,7 @@ SUMMARY_PROMPT = dedent("""
 
 # function to turn string returned from the LLM into valid python dictionary
 def extract_json(text):
+    # Helper function to find the matching closing brace or bracket
     def find_closing(text, open_pos, open_char, close_char):
         balance = 0
         for i in range(open_pos, len(text)):
@@ -45,12 +48,14 @@ def extract_json(text):
                     return i
         return -1
 
+    # Find the start of the JSON object/array
     obj_start = text.find("{")
     arr_start = text.find("[")
 
     if obj_start == -1 and arr_start == -1:
-        return {}, None
+        return {}, None  # No JSON found
 
+    # Determine which comes first or use -1 if not found
     start_index = (
         obj_start
         if arr_start == -1 or (obj_start != -1 and obj_start < arr_start)
@@ -59,6 +64,7 @@ def extract_json(text):
     open_char = "{" if start_index == obj_start else "["
     close_char = "}" if open_char == "{" else "]"
 
+    # Find the matching closing brace/bracket
     end_index = find_closing(text, start_index, open_char, close_char)
 
     if start_index != -1 and end_index != -1:
@@ -67,7 +73,7 @@ def extract_json(text):
             json_response = json.loads(json_text)
             return json_response, text[end_index + 1 :]
         except json.JSONDecodeError:
-            return {}, None
+            return {}, None  # Handle invalid JSON
     else:
         return {}, None
 
@@ -143,7 +149,7 @@ def recent_sessions(
     sessions_list = [
         d
         for d in sessions_list
-        if d.keys() == {"time_start", "time_end", "description"}
+        if d.keys() == {"time_start", "time_end", "description", "interests"}
     ]
     malformed_sessions = all_sessions - len(sessions_list)
     context.add_output_metadata(
