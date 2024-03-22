@@ -7,6 +7,7 @@ from dagster import AssetExecutionContext, Config, asset
 from mistralai.models.chat_completion import ChatMessage
 from pydantic import Field
 
+from ..consts import DEPLOYMENT_ROW_LIMIT
 from ..partitions import user_partitions_def
 from ..resources.mistral_resource import MistralResource
 
@@ -83,6 +84,13 @@ def get_completion(prompt, client, model="mistral-tiny"):
 
 
 class SessionsConfig(Config):
+    row_limit: int = Field(
+        default=DEPLOYMENT_ROW_LIMIT,
+        description=(
+            "Compute results for a subset of the data. Useful for testing "
+            "environments."
+        ),
+    )
     chunk_size: int = Field(default=15, description="The size of each chunk.")
 
 
@@ -95,6 +103,9 @@ def recent_sessions(
 ):
     # Sort the data by time -- Polars might read data out-of-order
     df = recent_takeout.sort("hour").select("title", "hour")
+
+    # Enforce the row_limit (if any)
+    df = df.slice(0, config.row_limit)
     num_chunks = math.ceil(recent_takeout.height / config.chunk_size)
 
     client = mistral.get_client()

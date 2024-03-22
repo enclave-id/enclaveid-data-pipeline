@@ -25,3 +25,5 @@ DAGSTER_STORAGE_BUCKET = {
     "BRANCH": UPath("az://enclaveid-dagster-staging-bucket/"),
     "PROD": UPath("az://enclaveid-dagster-prod-bucket/"),
 }[DEPLOYMENT_TYPE]
+
+DEPLOYMENT_ROW_LIMIT = {"LOCAL": 100, "BRANCH": 1000, "PROD": None}[DEPLOYMENT_TYPE]
