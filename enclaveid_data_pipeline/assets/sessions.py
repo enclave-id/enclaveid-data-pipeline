@@ -3,13 +3,13 @@ import math
 from textwrap import dedent
 
 import polars as pl
-from dagster import AssetExecutionContext, Config, asset
+from dagster import AssetExecutionContext, asset
 from mistralai.models.chat_completion import ChatMessage
 from pydantic import Field
 
-from ..consts import DEPLOYMENT_ROW_LIMIT
 from ..partitions import user_partitions_def
 from ..resources.mistral_resource import MistralResource
+from ..utils.custom_config import RowLimitConfig
 
 SUMMARY_PROMPT = dedent("""
     Analyze the provided list of Google search records to identify distinct topic groups. For each group, create a summary in the JSON format below. Ensure each summary includes: 
@@ -89,14 +89,7 @@ def get_completion(prompt, client, model="mistral-tiny"):
     return chat_response.choices[0].message.content
 
 
-class SessionsConfig(Config):
-    row_limit: int = Field(
-        default=DEPLOYMENT_ROW_LIMIT,
-        description=(
-            "Compute results for a subset of the data. Useful for testing "
-            "environments."
-        ),
-    )
+class SessionsConfig(RowLimitConfig):
     chunk_size: int = Field(default=15, description="The size of each chunk.")
 
 

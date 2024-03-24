@@ -5,23 +5,16 @@ import polars as pl
 from dagster import (
     AssetExecutionContext,
     AssetOut,
-    Config,
     multi_asset,
 )
 from pydantic import Field
 
-from ..consts import DEPLOYMENT_ROW_LIMIT, PRODUCTION_STORAGE_BUCKET
+from ..consts import PRODUCTION_STORAGE_BUCKET
 from ..partitions import user_partitions_def
+from ..utils.custom_config import RowLimitConfig
 
 
-class TakeoutConfig(Config):
-    row_limit: int = Field(
-        default=DEPLOYMENT_ROW_LIMIT,
-        description=(
-            "Compute results for a subset of the data. Useful for testing "
-            "environments."
-        ),
-    )
+class TakeoutConfig(RowLimitConfig):
     threshold: str = Field(
         # TODO: Change back to -3mo before deployment.
         default="-15d",
