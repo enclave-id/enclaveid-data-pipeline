@@ -1,4 +1,11 @@
 name: Serverless Prod Deployment
+
+permissions:
+  contents: read
+  metadata: read
+  packages: read
+  pull-requests: write
+
 on:
   push:
     branches:

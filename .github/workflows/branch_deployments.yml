@@ -1,4 +1,11 @@
 name: Serverless Branch Deployments
+
+permissions:
+  contents: read
+  metadata: read
+  packages: read
+  pull-requests: write
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
