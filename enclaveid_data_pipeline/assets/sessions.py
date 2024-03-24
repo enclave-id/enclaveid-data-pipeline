@@ -253,16 +253,23 @@ def recent_sessions(
 
 
 # TODO: Consider making this a method of the MistralResource.
-def get_embeddings(texts: pl.Series, client) -> pl.Series:
+def get_embeddings(
+    texts: pl.Series, client: MistralClient, chunk_size: int, logger: DagsterLogManager
+) -> pl.Series:
     # TODO: Maybe we want to make this async?
-    response = client.embeddings(
-        model="mistral-embed",
-        input=texts.to_list(),
-    )
+    num_chunks = math.ceil(len(texts) / chunk_size)
+    embeddings = []
+    for idx in range(0, len(texts), chunk_size):
+        logger.info(f"Processing chunk {int(idx/chunk_size) + 1} / {num_chunks}")
 
-    return pl.Series(
-        (x.embedding for x in response.data), dtype=pl.Array(pl.Float64, 1024)
-    )
+        response = client.embeddings(
+            model="mistral-embed",
+            input=texts.slice(idx, chunk_size).to_list(),
+        )
+
+        embeddings.extend(x.embedding for x in response.data)
+
+    return pl.Series(embeddings, dtype=pl.Array(pl.Float64, 1024))
 
 
 # TODO: Consider encapsulating this logic in an IOManager.
@@ -270,10 +277,12 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     context.log.info(f"Flushing existing rows for partition: {context.partition_key}")
     with psycopg.connect(os.getenv("PSQL_URL", ""), autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"DELETE FROM {context.asset_key[-1]} "  # type: ignore
+            cleanup_query = (
+                f"DELETE FROM {context.asset_key.path[-1]} "
                 f"WHERE user_id = '{context.partition_key}'"
             )
+            context.log.debug(f"Executing query:\n{cleanup_query}")
+            cur.execute(cleanup_query)  # type: ignore
 
     context.log.info(f"COPYing {len(df)} rows to Postgres...")
     col_list = (
@@ -289,7 +298,7 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     df = df.select(col_list)
 
     copy_statement = (
-        "COPY recent_session_embeddings "
+        f"COPY {context.asset_key.path[-1]} "
         f"({', '.join(col_list)}) "
         "FROM STDIN "
         "WITH (FORMAT BINARY)"
@@ -300,7 +309,7 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     with psycopg.connect(os.getenv("PSQL_URL", ""), autocommit=True) as conn:
         register_vector(conn)
 
-        with conn.cursor().copy(copy_statement) as copy:
+        with conn.cursor().copy(copy_statement) as copy:  # type: ignore
             # Binary copy requires explicitly setting the types.
             # https://www.psycopg.org/psycopg3/docs/basic/copy.html#binary-copy
             copy.set_types(["text", "date", "time", "time", "text", "text[]", "vector"])
@@ -316,11 +325,18 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     context.log.info("Finished COPY operation.")
 
 
+class SessionEmbeddingsConfig(RowLimitConfig):
+    chunk_size: int = Field(default=100, description="The size of each chunk.")
+
+
 # TODO: Consider incorporate this logic inside recent_sessions.
-@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+@asset(
+    partitions_def=user_partitions_def,
+    io_manager_key="parquet_io_manager",
+)
 def recent_session_embeddings(
     context: AssetExecutionContext,
-    config: RowLimitConfig,
+    config: SessionEmbeddingsConfig,
     mistral: MistralResource,
     recent_sessions: pl.DataFrame,
 ) -> pl.DataFrame:
@@ -331,7 +347,12 @@ def recent_session_embeddings(
     client = mistral.get_client()
     recent_sessions = recent_sessions.with_columns(
         embedding=pl.col("description").map_batches(
-            partial(get_embeddings, client=client)
+            partial(
+                get_embeddings,
+                client=client,
+                chunk_size=config.chunk_size,
+                logger=context.log,
+            )
         ),
         user_id=pl.lit(context.partition_key),
     )
@@ -350,6 +371,7 @@ def recent_sessions_graph(
 ):
     client = postgres.get_client()
 
+    # TODO: @Giovanni, should the threshold be calculated per user?
     time_threshold = client.execute_query(
         query="""
         WITH LaggedDocuments AS (
