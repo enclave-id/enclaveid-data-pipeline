@@ -1,10 +1,14 @@
 import json
 import math
+import os
+from functools import partial
 from textwrap import dedent
 
 import polars as pl
+import psycopg
 from dagster import AssetExecutionContext, asset
 from mistralai.models.chat_completion import ChatMessage
+from pgvector.psycopg import register_vector
 from pydantic import Field
 
 from ..partitions import user_partitions_def
@@ -78,6 +82,7 @@ def extract_json(text):
         return {}, None
 
 
+# TODO: Consider making this a method of the MistralResource.
 def get_completion(prompt, client, model="mistral-tiny"):
     messages = [ChatMessage(role="user", content=prompt)]
 
@@ -93,13 +98,13 @@ class SessionsConfig(RowLimitConfig):
     chunk_size: int = Field(default=15, description="The size of each chunk.")
 
 
-@asset(partitions_def=user_partitions_def)
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
 def recent_sessions(
     context: AssetExecutionContext,
     config: SessionsConfig,
     mistral: MistralResource,
     recent_takeout: pl.DataFrame,
-):
+) -> pl.DataFrame:
     # Sort the data by time -- Polars might read data out-of-order
     df = recent_takeout.sort("hour").select("title", "hour")
 
@@ -152,4 +157,84 @@ def recent_sessions(
             "error_rate": round(malformed_sessions / all_sessions, 2),
         }
     )
-    return pl.from_dicts(sessions_list)
+
+    # Conver to a data frame and cast the times from string to pl.Time
+    output = pl.from_dicts(sessions_list).with_columns(
+        pl.col("time_end").str.strptime(pl.Time, "%H:%M"),
+        pl.col("time_start").str.strptime(pl.Time, "%H:%M"),
+    )
+
+    return output
+
+
+# TODO: Consider making this a method of the MistralResource.
+def get_embeddings(texts: pl.Series, client) -> pl.Series:
+    # TODO: Maybe we want to make this async?
+    response = client.embeddings(
+        model="mistral-embed",
+        input=texts.to_list(),
+    )
+
+    return pl.Series(
+        (x.embedding for x in response.data), dtype=pl.Array(pl.Float64, 1024)
+    )
+
+
+# TODO: Consider encapsulating this logic in an IOManager.
+def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
+    context.log.info(f"COPYing {len(df)} rows to Postgres...")
+
+    copy_statement = (
+        "COPY recent_sessions "
+        "(user_id, description, time_start, time_end, interests, embedding) "
+        "FROM STDIN "
+        "WITH (FORMAT BINARY)"
+    )
+
+    # TODO: Optimization -- Using psycopg.AsyncConnection or asyncpg should speed this up
+    num_rows = df.height
+    with psycopg.connect(os.getenv("PSQL_URL", ""), autocommit=True) as conn:
+        register_vector(conn)
+
+        with conn.cursor().copy(copy_statement) as copy:
+            # Binary copy requires explicitly setting the types.
+            # https://www.psycopg.org/psycopg3/docs/basic/copy.html#binary-copy
+            copy.set_types(["text", "text", "time", "time", "text[]", "vector"])
+
+            for idx, r in enumerate(df.iter_rows(), start=1):
+                copy.write_row(r)
+                while conn.pgconn.flush() == 1:
+                    pass
+
+                if idx % 10 == 0 or idx == num_rows:
+                    context.log.info(f"Finished copying {idx} / {num_rows} rows.")
+
+    context.log.info("Finished COPY operation.")
+
+
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+def recent_session_embeddings(
+    context: AssetExecutionContext,
+    config: RowLimitConfig,
+    mistral: MistralResource,
+    recent_sessions: pl.DataFrame,
+) -> pl.DataFrame:
+    # Enforce row_limit (if any)
+    recent_sessions = recent_sessions.slice(0, config.row_limit)
+
+    context.log.info("Getting embeddings...")
+    client = mistral.get_client()
+    recent_sessions = recent_sessions.with_columns(
+        embeddings=pl.col("description").map_batches(
+            partial(get_embeddings, client=client)
+        ),
+        user_id=pl.lit(context.partition_key),
+    ).select(
+        "user_id", "description", "time_start", "time_end", "interests", "embeddings"
+    )
+
+    upload_embeddings(recent_sessions, context)
+    return recent_sessions
+
+
+# FIXME: Next steps -- research pgvector and create an IOManager for storing the embeddings.

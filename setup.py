@@ -10,8 +10,10 @@ setup(
         "dagster-polars",
         "mistralai",
         "numpy",
-        "polars",
+        "polars==0.20.15",
         "pandas",
+        "pgvector",
+        "psycopg",
         "pyarrow",
         "openai",
         "httpx",
@@ -23,6 +25,7 @@ setup(
             "pytest",
             "ipython",
             "ipykernel",
+            "ipywidgets",
         ]
     },
 )
