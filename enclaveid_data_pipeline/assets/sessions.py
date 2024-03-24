@@ -1,12 +1,15 @@
+import datetime
 import json
 import math
 import os
+from dataclasses import dataclass
 from functools import partial
 from textwrap import dedent
 
 import polars as pl
 import psycopg
-from dagster import AssetExecutionContext, asset
+from dagster import AssetExecutionContext, DagsterLogManager, asset
+from mistralai.client import MistralClient
 from mistralai.models.chat_completion import ChatMessage
 from pgvector.psycopg import register_vector
 from pydantic import Field
@@ -83,7 +86,7 @@ def extract_json(text):
 
 
 # TODO: Consider making this a method of the MistralResource.
-def get_completion(prompt, client, model="mistral-tiny"):
+def get_completion(prompt, client: MistralClient, model="mistral-tiny"):
     messages = [ChatMessage(role="user", content=prompt)]
 
     chat_response = client.chat(
@@ -94,30 +97,33 @@ def get_completion(prompt, client, model="mistral-tiny"):
     return chat_response.choices[0].message.content
 
 
-class SessionsConfig(RowLimitConfig):
-    chunk_size: int = Field(default=15, description="The size of each chunk.")
+@dataclass
+class ChunkedSessionOutput:
+    output_df: pl.DataFrame
+    raw_answers: list[str | list[str]]
+    num_sessions: int
+    invalid_types: int
+    invalid_keys: int
+    invalid_times: int
+    invalid_sessions: int
 
 
-@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
-def recent_sessions(
-    context: AssetExecutionContext,
-    config: SessionsConfig,
-    mistral: MistralResource,
-    recent_takeout: pl.DataFrame,
-) -> pl.DataFrame:
-    # Sort the data by time -- Polars might read data out-of-order
-    df = recent_takeout.sort("hour").select("title", "hour")
+def get_daily_sessions(
+    df: pl.DataFrame,
+    client: MistralClient,
+    chunk_size: int,
+    logger: DagsterLogManager,
+    day: datetime.date,
+) -> ChunkedSessionOutput:
+    df = df.select("hour", "title")
+    num_chunks = math.ceil(df.height / chunk_size)
 
-    # Enforce the row_limit (if any)
-    df = df.slice(0, config.row_limit)
-    num_chunks = math.ceil(recent_takeout.height / config.chunk_size)
-
-    client = mistral.get_client()
+    raw_answers = []
+    sessions_list = []
 
     # TODO: Make this async / concurrent.
-    sessions_list = []
-    for idx, frame in enumerate(df.iter_slices(n_rows=config.chunk_size)):
-        context.log.info(f"Processing chunk {idx + 1} / {num_chunks}")
+    for idx, frame in enumerate(df.iter_slices(n_rows=chunk_size), start=1):
+        logger.info(f"[{day}]  Processing chunk {idx} / {num_chunks}")
 
         # Set Polars' string formatting so none of the rows or strings are
         # compressed / cut off.
@@ -130,6 +136,7 @@ def recent_sessions(
             tbl_rows=-1,
         ):
             answer = get_completion(f"{SUMMARY_PROMPT}\n{frame}", client)
+            raw_answers.append(answer)
 
         # Sometimes the LLM returns multipe json objects in a list
         # Some other times it returns a single json object
@@ -144,27 +151,104 @@ def recent_sessions(
                     sessions_list.extend(parsed_result)
 
     all_sessions = len(sessions_list)
+
+    # Filter out responses with the wrong type
+    sessions_list = [x for x in sessions_list if isinstance(x, dict)]
+    valid_types = len(sessions_list)
+    invalid_types = all_sessions - valid_types
+
+    # Filter out responses with the wrong JSON format/keys
     sessions_list = [
         d
         for d in sessions_list
         if d.keys() == {"time_start", "time_end", "description", "interests"}
     ]
-    malformed_sessions = all_sessions - len(sessions_list)
+    valid_keys = len(sessions_list)
+    invalid_keys = valid_types - valid_keys
+
+    output = (
+        pl.from_dicts(
+            sessions_list,
+            schema={
+                "time_start": pl.Utf8,
+                "time_end": pl.Utf8,
+                "description": pl.Utf8,
+                "interests": pl.List(pl.Utf8),
+            },
+        )
+        # Filter out any rows with invalid time strings.
+        .filter(
+            pl.col("time_end").str.contains(r"^\d{2}:\d{2}$")
+            & pl.col("time_start").str.contains(r"^\d{2}:\d{2}$")
+        )
+        # Cast the times from string to pl.Time and add the date
+        .with_columns(
+            pl.col("time_end").str.strptime(pl.Time, "%H:%M"),
+            pl.col("time_start").str.strptime(pl.Time, "%H:%M"),
+            date=pl.lit(day),
+        )
+    )
+
+    invalid_times = valid_keys - len(output)
+    return ChunkedSessionOutput(
+        output_df=output,
+        raw_answers=raw_answers,
+        num_sessions=all_sessions,
+        invalid_types=invalid_types,
+        invalid_keys=invalid_keys,
+        invalid_times=invalid_times,
+        invalid_sessions=invalid_types + invalid_keys + invalid_times,
+    )
+
+
+class SessionsConfig(RowLimitConfig):
+    chunk_size: int = Field(default=15, description="The size of each chunk.")
+
+
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+def recent_sessions(
+    context: AssetExecutionContext,
+    config: SessionsConfig,
+    mistral: MistralResource,
+    recent_takeout: pl.DataFrame,
+) -> pl.DataFrame:
+    # Enforce the row_limit (if any) per day
+    recent_takeout = recent_takeout.slice(0, config.row_limit)
+
+    client = mistral.get_client()
+
+    # Sort the data by time -- Polars might read data out-of-order
+    recent_sessions = recent_takeout.sort("timestamp")
+
+    # Split into multiple data frames (one per day). This is necessary to correctly
+    # identify the data associated with each time entry.
+    daily_dfs = recent_sessions.with_columns(
+        date=pl.col("timestamp").dt.date()
+    ).partition_by("date", as_dict=True, include_key=False)
+
+    # TODO: Make this (and the calls inside get_daily_sessions) async/concurrent.
+    daily_outputs: list[ChunkedSessionOutput] = []
+    for day, day_df in daily_dfs.items():
+        daily_outputs.append(
+            get_daily_sessions(day_df, client, config.chunk_size, context.log, day)
+        )
+
     context.add_output_metadata(
         {
-            "num_chunks": num_chunks,
-            "malformed_chunks": malformed_sessions,
-            "error_rate": round(malformed_sessions / all_sessions, 2),
+            "num_sessions": sum(out.num_sessions for out in daily_outputs),
+            "invalid_types": sum(out.invalid_types for out in daily_outputs),
+            "invalid_keys": sum(out.invalid_keys for out in daily_outputs),
+            "invalid_times": sum(out.invalid_times for out in daily_outputs),
+            "invalid_sessions": sum(out.invalid_sessions for out in daily_outputs),
+            "error_rate": round(
+                sum(out.invalid_sessions for out in daily_outputs)
+                / sum(out.num_sessions for out in daily_outputs),
+                2,
+            ),
         }
     )
 
-    # Conver to a data frame and cast the times from string to pl.Time
-    output = pl.from_dicts(sessions_list).with_columns(
-        pl.col("time_end").str.strptime(pl.Time, "%H:%M"),
-        pl.col("time_start").str.strptime(pl.Time, "%H:%M"),
-    )
-
-    return output
+    return pl.concat((out.output_df for out in daily_outputs))
 
 
 # TODO: Consider making this a method of the MistralResource.
