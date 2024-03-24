@@ -267,6 +267,14 @@ def get_embeddings(texts: pl.Series, client) -> pl.Series:
 
 # TODO: Consider encapsulating this logic in an IOManager.
 def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
+    context.log.info(f"Flushing existing rows for partition: {context.partition_key}")
+    with psycopg.connect(os.getenv("PSQL_URL", ""), autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {context.asset_key[-1]} "  # type: ignore
+                f"WHERE user_id = '{context.partition_key}'"
+            )
+
     context.log.info(f"COPYing {len(df)} rows to Postgres...")
     col_list = (
         "user_id",
