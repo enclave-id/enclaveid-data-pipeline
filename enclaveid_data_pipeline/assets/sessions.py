@@ -267,10 +267,21 @@ def get_embeddings(texts: pl.Series, client) -> pl.Series:
 # TODO: Consider encapsulating this logic in an IOManager.
 def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     context.log.info(f"COPYing {len(df)} rows to Postgres...")
+    col_list = (
+        "user_id",
+        "date",
+        "time_start",
+        "time_end",
+        "description",
+        "interests",
+        "embedding",
+    )
+
+    df = df.select(col_list)
 
     copy_statement = (
         "COPY recent_sessions "
-        "(user_id, description, time_start, time_end, interests, embedding) "
+        f"({', '.join(col_list)}) "
         "FROM STDIN "
         "WITH (FORMAT BINARY)"
     )
@@ -283,7 +294,7 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
         with conn.cursor().copy(copy_statement) as copy:
             # Binary copy requires explicitly setting the types.
             # https://www.psycopg.org/psycopg3/docs/basic/copy.html#binary-copy
-            copy.set_types(["text", "text", "time", "time", "text[]", "vector"])
+            copy.set_types(["text", "date", "time", "time", "text", "text[]", "vector"])
 
             for idx, r in enumerate(df.iter_rows(), start=1):
                 copy.write_row(r)
@@ -309,12 +320,10 @@ def recent_session_embeddings(
     context.log.info("Getting embeddings...")
     client = mistral.get_client()
     recent_sessions = recent_sessions.with_columns(
-        embeddings=pl.col("description").map_batches(
+        embedding=pl.col("description").map_batches(
             partial(get_embeddings, client=client)
         ),
         user_id=pl.lit(context.partition_key),
-    ).select(
-        "user_id", "description", "time_start", "time_end", "interests", "embeddings"
     )
 
     upload_embeddings(recent_sessions, context)
