@@ -1,17 +1,16 @@
 name: Serverless Prod Deployment
 
-permissions:
-  contents: read
-  metadata: read
-  packages: read
-  pull-requests: write
-
 on:
   push:
     branches:
       - "main"
       - "master"
-    
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: write
+
 concurrency:
   # Cancel in-progress deploys to same branch
   group: ${{ github.ref }}/deploy
