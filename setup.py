@@ -6,7 +6,7 @@ setup(
     install_requires=[
         "adlfs",
         "dagster>=1.6.0,<1.7.0",
-        "dagster-aws",
+        "dagster-aws[redshift]",
         "dagster-cloud",
         "dagster-polars",
         "mistralai",
@@ -15,7 +15,6 @@ setup(
         "pandas",
         "pgvector",
         "psycopg",
-        "psycopg2-binary",  # Needed by dagster-aws
         "pyarrow",
         "openai",
         "httpx",
