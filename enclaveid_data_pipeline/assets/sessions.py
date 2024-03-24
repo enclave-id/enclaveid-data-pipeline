@@ -281,7 +281,7 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     df = df.select(col_list)
 
     copy_statement = (
-        "COPY recent_sessions "
+        "COPY recent_session_embeddings "
         f"({', '.join(col_list)}) "
         "FROM STDIN "
         "WITH (FORMAT BINARY)"
@@ -308,6 +308,7 @@ def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
     context.log.info("Finished COPY operation.")
 
 
+# TODO: Consider incorporate this logic inside recent_sessions.
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
 def recent_session_embeddings(
     context: AssetExecutionContext,
@@ -331,16 +332,18 @@ def recent_session_embeddings(
     return recent_sessions
 
 
-@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
-def downstream(
+@asset(
+    partitions_def=user_partitions_def,
+    deps=[recent_session_embeddings],
+)
+def recent_sessions_graph(
     context: AssetExecutionContext,
-    recent_session_embeddings: pl.DataFrame,
     postgres: PostgresClientResource,
 ):
     client = postgres.get_client()
 
-    time_threshold_query = dedent(
-        """
+    time_threshold = client.execute_query(
+        query="""
         WITH LaggedDocuments AS (
             SELECT
                 date,
@@ -348,7 +351,7 @@ def downstream(
                 time_end,
                 LAG(time_end) OVER (ORDER BY date, time_start) AS prev_time_end
             FROM
-                recent_sessions
+                recent_session_embeddings
         ),
         
         TimeDifferences AS (
@@ -363,21 +366,20 @@ def downstream(
         SELECT
             percentile_cont(0.10) WITHIN GROUP (ORDER BY time_diff) AS time_interval_10th
         FROM
-            TimeDifferences"""
-    )
+            TimeDifferences
+        """,
+        fetch_results=True,
+    )[0][0]  # type: ignore
 
-    time_threshold = client.execute_query(time_threshold_query, fetch_results=True)
-    time_threshold = time_threshold[0][0]  # type: ignore
-
-    similarity_threshold_query = dedent(
-        """
+    similarity_threshold = client.execute_query(
+        query="""
         WITH CosineSimilarities AS (
             SELECT
                 date,
                 time_start,
                 1 - (embedding <=> LAG(embedding) OVER (ORDER BY date, time_start)) AS cosine_similarity
             FROM
-                recent_sessions
+                recent_session_embeddings
         ),
 
         FilteredSimilarities AS (
@@ -392,11 +394,8 @@ def downstream(
         SELECT
             percentile_cont(0.90) WITHIN GROUP (ORDER BY cosine_similarity) AS embedding_similarity_90th
         FROM
-            FilteredSimilarities"""
-    )
-
-    similarity_threshold = client.execute_query(
-        similarity_threshold_query, fetch_results=True
+            FilteredSimilarities""",
+        fetch_results=True,
     )[0][0]  # type: ignore
 
     context.log.info(
@@ -404,29 +403,88 @@ def downstream(
         f"Embedding similarity threshold: {similarity_threshold:.4f}"
     )
 
-    # TODO: @Giovanni, matching on the row ID is error-prone.
+    # TODO: @Giovanni
     #
-    # I've also
-    #   - removed the division by 60 (it seemed redundant)
-    #   - swapped the order (i.e., it's now b - a instead of a - b)
-    #   - incorporate the similarity matching into the where clause
-    similar_records = client.execute_query(
-        f"""
-        SELECT 
-            a.id as a_id, 
-            b.id as b_id, 
-            1 - (a.embedding <=> b.embedding) AS similarity
-        FROM recent_sessions a
-        JOIN recent_sessions b ON a.id < b.id
-        WHERE
-            1 - (a.embedding <=> b.embedding) >= {similarity_threshold}
-            AND ABS(
-                EXTRACT(EPOCH FROM (
-                    (b.date || ' ' || b.time_start)::timestamp
-                    - (a.date || ' ' || a.time_end)::timestamp 
-                ))
-            ) <= {time_threshold}
-        """,
-        fetch_results=True,
+    # - I'm also including the `user_id`; otherwise, you'd be matching sessions
+    #   across users.
+    # - FilteredPairs2 is redundant and is the same as FilteredPairs1
+
+    # Cleanup existing data for this partition (i.e., user)
+    client.execute_query(
+        f"DELETE FROM recent_sessions_graph where user_id = '{context.partition_key}'"
     )
-    return None
+
+    # Update the graph with the edges for this partition (i.e., user)
+    client.execute_query(
+        f"""
+        WITH DocumentPairs AS (
+            SELECT
+                a.user_id,
+                a.id AS doc_id,
+                b.id AS compared_doc_id,
+                1 - (a.embedding <=> b.embedding) AS similarity,
+                a.date AS doc_date,
+                b.date AS compared_doc_date,
+                    a.time_end AS doc_time_end,
+                b.time_start AS compared_doc_time_start
+            FROM
+                recent_session_embeddings a
+            JOIN
+                recent_session_embeddings b 
+                    ON
+                        a.user_id = '{context.partition_key}'
+                        AND a.user_id = b.user_id
+                        AND a.id != b.id 
+                        AND (
+                            b.date > a.date 
+                            OR (a.date = b.date AND b.time_start > a.time_end)
+                        )
+        ),
+
+        RankedPairs AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER(
+                    PARTITION BY user_id, doc_id
+                    ORDER BY similarity DESC
+                ) AS rank
+            FROM
+                DocumentPairs
+        ), 
+
+        FilteredPairs1 as (
+            SELECT
+                user_id,
+                doc_id,
+                compared_doc_id,
+                similarity
+            FROM
+                RankedPairs
+            WHERE
+                rank = 1
+                    AND similarity > {similarity_threshold}
+        ), 
+
+        FilteredPairs2 as (
+            SELECT
+                user_id,
+                doc_id,
+                MAX(compared_doc_id) AS compared_doc_id,
+                MAX(similarity) AS similarity
+            FROM
+                FilteredPairs1
+            group by user_id, doc_id
+        )
+
+        INSERT INTO recent_sessions_graph (user_id, parent_id, child_id, weight)
+        
+        SELECT
+            user_id,
+            doc_id,
+            compared_doc_id,
+            /* distance = 1 - similarity */
+            1 - similarity as distance
+        FROM
+            FilteredPairs2
+        """
+    )
