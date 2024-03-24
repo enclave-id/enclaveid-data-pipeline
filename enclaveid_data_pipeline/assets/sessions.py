@@ -16,6 +16,7 @@ from pydantic import Field
 
 from ..partitions import user_partitions_def
 from ..resources.mistral_resource import MistralResource
+from ..resources.postgres_resource import PostgresClientResource
 from ..utils.custom_config import RowLimitConfig
 
 SUMMARY_PROMPT = dedent("""
@@ -330,4 +331,102 @@ def recent_session_embeddings(
     return recent_sessions
 
 
-# FIXME: Next steps -- research pgvector and create an IOManager for storing the embeddings.
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+def downstream(
+    context: AssetExecutionContext,
+    recent_session_embeddings: pl.DataFrame,
+    postgres: PostgresClientResource,
+):
+    client = postgres.get_client()
+
+    time_threshold_query = dedent(
+        """
+        WITH LaggedDocuments AS (
+            SELECT
+                date,
+                time_start,
+                time_end,
+                LAG(time_end) OVER (ORDER BY date, time_start) AS prev_time_end
+            FROM
+                recent_sessions
+        ),
+        
+        TimeDifferences AS (
+            SELECT
+                EXTRACT(EPOCH FROM (time_start - prev_time_end)) AS time_diff
+            FROM
+                LaggedDocuments
+            WHERE
+                time_start > prev_time_end
+        )
+        
+        SELECT
+            percentile_cont(0.10) WITHIN GROUP (ORDER BY time_diff) AS time_interval_10th
+        FROM
+            TimeDifferences"""
+    )
+
+    time_threshold = client.execute_query(time_threshold_query, fetch_results=True)
+    time_threshold = time_threshold[0][0]  # type: ignore
+
+    similarity_threshold_query = dedent(
+        """
+        WITH CosineSimilarities AS (
+            SELECT
+                date,
+                time_start,
+                1 - (embedding <=> LAG(embedding) OVER (ORDER BY date, time_start)) AS cosine_similarity
+            FROM
+                recent_sessions
+        ),
+
+        FilteredSimilarities AS (
+            SELECT
+                cosine_similarity
+            FROM
+                CosineSimilarities
+            WHERE
+                cosine_similarity IS NOT NULL
+        )
+        
+        SELECT
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY cosine_similarity) AS embedding_similarity_90th
+        FROM
+            FilteredSimilarities"""
+    )
+
+    similarity_threshold = client.execute_query(
+        similarity_threshold_query, fetch_results=True
+    )[0][0]  # type: ignore
+
+    context.log.info(
+        f"Time threshold: {time_threshold:.2f} seconds. "
+        f"Embedding similarity threshold: {similarity_threshold:.4f}"
+    )
+
+    # TODO: @Giovanni, matching on the row ID is error-prone.
+    #
+    # I've also
+    #   - removed the division by 60 (it seemed redundant)
+    #   - swapped the order (i.e., it's now b - a instead of a - b)
+    #   - incorporate the similarity matching into the where clause
+    similar_records = client.execute_query(
+        f"""
+        SELECT 
+            a.id as a_id, 
+            b.id as b_id, 
+            1 - (a.embedding <=> b.embedding) AS similarity
+        FROM recent_sessions a
+        JOIN recent_sessions b ON a.id < b.id
+        WHERE
+            1 - (a.embedding <=> b.embedding) >= {similarity_threshold}
+            AND ABS(
+                EXTRACT(EPOCH FROM (
+                    (b.date || ' ' || b.time_start)::timestamp
+                    - (a.date || ' ' || a.time_end)::timestamp 
+                ))
+            ) <= {time_threshold}
+        """,
+        fetch_results=True,
+    )
+    return None
