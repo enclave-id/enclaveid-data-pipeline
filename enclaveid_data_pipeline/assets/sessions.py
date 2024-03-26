@@ -373,7 +373,7 @@ def recent_sessions_graph(
 
     # TODO: @Giovanni, should the threshold be calculated per user?
     time_threshold = client.execute_query(
-        query="""
+        query=f"""
         WITH LaggedDocuments AS (
             SELECT
                 date,
@@ -382,6 +382,8 @@ def recent_sessions_graph(
                 LAG(time_end) OVER (ORDER BY date, time_start) AS prev_time_end
             FROM
                 recent_session_embeddings
+            WHERE
+                user_id = '{context.partition_key}'
         ),
         
         TimeDifferences AS (
@@ -402,7 +404,7 @@ def recent_sessions_graph(
     )[0][0]  # type: ignore
 
     similarity_threshold = client.execute_query(
-        query="""
+        query=f"""
         WITH CosineSimilarities AS (
             SELECT
                 date,
@@ -410,6 +412,8 @@ def recent_sessions_graph(
                 1 - (embedding <=> LAG(embedding) OVER (ORDER BY date, time_start)) AS cosine_similarity
             FROM
                 recent_session_embeddings
+            WHERE
+                user_id = '{context.partition_key}'
         ),
 
         FilteredSimilarities AS (
