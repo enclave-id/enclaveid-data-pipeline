@@ -497,17 +497,6 @@ def recent_sessions_graph(
             WHERE
                 rank = 1
                     AND similarity > {similarity_threshold}
-        ), 
-
-        FilteredPairs2 as (
-            SELECT
-                user_id,
-                doc_id,
-                MAX(compared_doc_id) AS compared_doc_id,
-                MAX(similarity) AS similarity
-            FROM
-                FilteredPairs1
-            group by user_id, doc_id
         )
 
         INSERT INTO recent_sessions_graph (user_id, parent_id, child_id, weight)
@@ -519,6 +508,6 @@ def recent_sessions_graph(
             /* distance = 1 - similarity */
             1 - similarity as distance
         FROM
-            FilteredPairs2
+            FilteredPairs1
         """
     )
