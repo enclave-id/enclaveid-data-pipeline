@@ -13,7 +13,7 @@ setup(
         "polars==0.20.15",
         "pandas",
         "pgvector",
-        "psycopg",
+        "psycopg[binary]",
         "pyarrow",
         "openai",
         "httpx",
