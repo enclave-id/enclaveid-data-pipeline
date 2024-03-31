@@ -16,7 +16,7 @@ from pydantic import Field
 
 from ..partitions import user_partitions_def
 from ..resources.mistral_resource import MistralResource
-from ..resources.postgres_resource import PostgresClientResource
+from ..resources.postgres_resource import PGVectorClient, PGVectorClientResource
 from ..utils.custom_config import RowLimitConfig
 
 SUMMARY_PROMPT = dedent("""
@@ -272,11 +272,14 @@ def get_embeddings(
     return pl.Series(embeddings, dtype=pl.Array(pl.Float64, 1024))
 
 
-# TODO: Consider encapsulating this logic in an IOManager.
-def upload_embeddings(df: pl.DataFrame, context: AssetExecutionContext):
+# TODO: Consider encapsulating this logic in an IOManager and/or moving the binary
+# copy logic into the PGVectorClient.
+def upload_embeddings(
+    context: AssetExecutionContext, client: PGVectorClient, df: pl.DataFrame
+):
     context.log.info(f"Flushing existing rows for partition: {context.partition_key}")
-    with psycopg.connect(os.getenv("PSQL_URL", ""), autocommit=True) as conn:
-        with conn.cursor() as cur:
+    with client._get_conn() as conn:
+        with client._get_cursor(conn) as cur:
             cleanup_query = (
                 f"DELETE FROM {context.asset_key.path[-1]} "
                 f"WHERE user_id = '{context.partition_key}'"
@@ -338,6 +341,7 @@ def recent_session_embeddings(
     context: AssetExecutionContext,
     config: SessionEmbeddingsConfig,
     mistral: MistralResource,
+    pgvector: PGVectorClientResource,
     recent_sessions: pl.DataFrame,
 ) -> pl.DataFrame:
     # Enforce row_limit (if any)
@@ -357,7 +361,7 @@ def recent_session_embeddings(
         user_id=pl.lit(context.partition_key),
     )
 
-    upload_embeddings(recent_sessions, context)
+    upload_embeddings(context, pgvector.get_client(), recent_sessions)
     return recent_sessions
 
 
@@ -367,9 +371,9 @@ def recent_session_embeddings(
 )
 def recent_sessions_graph(
     context: AssetExecutionContext,
-    postgres: PostgresClientResource,
+    pgvector: PGVectorClientResource,
 ):
-    client = postgres.get_client()
+    client = pgvector.get_client()
 
     # TODO: @Giovanni, should the threshold be calculated per user?
     time_threshold = client.execute_query(
