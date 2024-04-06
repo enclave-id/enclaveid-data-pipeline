@@ -5,17 +5,16 @@ import polars as pl
 from dagster import (
     AssetExecutionContext,
     AssetOut,
-    Config,
     multi_asset,
 )
 from pydantic import Field
 
-from enclaveid_data_pipeline.consts import PRODUCTION_STORAGE_BUCKET
-
+from ..consts import PRODUCTION_STORAGE_BUCKET
 from ..partitions import user_partitions_def
+from ..utils.custom_config import RowLimitConfig
 
 
-class TakeoutConfig(Config):
+class TakeoutConfig(RowLimitConfig):
     threshold: str = Field(
         # TODO: Change back to -3mo before deployment.
         default="-15d",
@@ -60,7 +59,9 @@ def parsed_takeout(
 
     # TODO: Temporarily using Pandas to read the JSON because Polars doesn't
     # play well with UPath. Will fix this later.
-    df = pl.from_pandas(pd.read_json(f), schema_overrides={"time": pl.Datetime}).select(
+    full_df = pl.from_pandas(
+        pd.read_json(f), schema_overrides={"time": pl.Datetime}
+    ).select(
         pl.all().exclude("time"),
         timestamp=pl.col("time"),
         date=pl.col("time").dt.date(),
@@ -68,6 +69,10 @@ def parsed_takeout(
         month=pl.col("time").dt.strftime("%Y-%m-%d"),
     )
 
-    return df, df.filter(
+    recent_df = full_df.filter(
         pl.col("timestamp") > pl.col("timestamp").max().dt.offset_by(config.threshold)
     )
+
+    # The row_limit is enforced on the output instead of the input because prematurely
+    # filtering the rows might leave no "recent" rows in the output, making recent_df empty.
+    return full_df.slice(0, config.row_limit), recent_df.slice(0, config.row_limit)

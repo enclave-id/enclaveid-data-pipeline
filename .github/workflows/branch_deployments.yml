@@ -1,7 +1,13 @@
 name: Serverless Branch Deployments
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: write
     
 concurrency:
   # Cancel in-progress deploys to same branch
@@ -10,7 +16,7 @@ concurrency:
 env:
   DAGSTER_CLOUD_URL: "http://enclaveid.dagster.cloud"
   DAGSTER_CLOUD_API_TOKEN: ${{ secrets.DAGSTER_CLOUD_API_TOKEN }}
-  ENABLE_FAST_DEPLOYS: 'true'
+  ENABLE_FAST_DEPLOYS: 'false'
   PYTHON_VERSION: '3.10'
   DAGSTER_CLOUD_FILE: 'dagster_cloud.yaml'
 
