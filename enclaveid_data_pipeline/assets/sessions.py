@@ -19,6 +19,9 @@ from ..resources.mistral_resource import MistralResource
 from ..resources.postgres_resource import PGVectorClient, PGVectorClientResource
 from ..utils.custom_config import RowLimitConfig
 
+# TODO: Avoid auto-committing queries and bundle them as one transaction,
+# where appropriate.
+
 SUMMARY_PROMPT = dedent("""
     Analyze the provided list of Google search records to identify distinct topic groups. For each group, create a summary in the JSON format below. Ensure each summary includes: 
 
@@ -511,8 +514,7 @@ def recent_sessions_merged(
         query=f"""
         SELECT 
             a.id, 
-            b.id, 
-            1 - (a.embedding <=> b.embedding) AS similarity
+            b.id
         FROM 
             recent_sessions_merged a
         JOIN 
@@ -523,19 +525,22 @@ def recent_sessions_merged(
                 AND a.id != b.id 
                 AND (
                     b.date > a.date 
-                    OR (a.date = b.date AND b.time_start > a.time_end)
+                    OR (a.date = b.date AND b.time_start >= a.time_end)
                 )
         WHERE 
             EXTRACT(
                 'epoch' FROM (
-                    (a.date || ' ' || a.time)::timestamp  
-                    - (b.date || ' ' || b.time)::timestamp)
+                    (b.date || ' ' || b.time_start)::timestamp
+                    - (a.date || ' ' || a.time_end)::timestamp
                 ) 
             ) <= {time_threshold}
             AND
             1 - (a.embedding <=> b.embedding) >= {similarity_threshold}""",
         fetch_results=True,
     )
+
+    msg = "\n".join(str(pair) for pair in candidates_to_merge)  # type: ignore
+    context.log.info(f"Merging sessions:\n{msg}")
 
     for a, b in candidates_to_merge:  # type: ignore
         # Update time_end of document a with the maximum time_end of both sessions
@@ -598,7 +603,7 @@ def recent_sessions_graph(
                 1 - (a.embedding <=> b.embedding) AS similarity,
                 a.date AS doc_date,
                 b.date AS compared_doc_date,
-                    a.time_end AS doc_time_end,
+                a.time_end AS doc_time_end,
                 b.time_start AS compared_doc_time_start
             FROM
                 recent_sessions_merged a
@@ -610,7 +615,7 @@ def recent_sessions_graph(
                     AND a.id != b.id 
                     AND (
                         b.date > a.date 
-                        OR (a.date = b.date AND b.time_start > a.time_end)
+                        OR (a.date = b.date AND b.time_start >= a.time_end)
                     )
         ),
 
