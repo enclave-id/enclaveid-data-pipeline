@@ -206,6 +206,8 @@ class SessionsConfig(RowLimitConfig):
     chunk_size: int = Field(default=15, description="The size of each chunk.")
 
 
+# TODO: Consider converting all these assets into a single graph-backed asset
+# called recent_sessions.
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
 def recent_sessions(
     context: AssetExecutionContext,
@@ -369,16 +371,15 @@ def recent_session_embeddings(
     partitions_def=user_partitions_def,
     deps=[recent_session_embeddings],
 )
-def recent_sessions_graph(
+def time_threshold(
     context: AssetExecutionContext,
     pgvector: PGVectorClientResource,
 ):
     client = pgvector.get_client()
-
-    # TODO: @Giovanni, should the threshold be calculated per user?
-    time_threshold = client.execute_query(
+    # Calculate the time and similarity thresholds for this user
+    results = client.execute_query(
         query=f"""
-        WITH LaggedDocuments AS (
+        WITH LaggedSessions AS (
             SELECT
                 date,
                 time_start,
@@ -392,9 +393,9 @@ def recent_sessions_graph(
         
         TimeDifferences AS (
             SELECT
-                EXTRACT(EPOCH FROM (time_start - prev_time_end)) AS time_diff
+                EXTRACT('epoch' FROM time_start - prev_time_end) AS time_diff
             FROM
-                LaggedDocuments
+                LaggedSessions
             WHERE
                 time_start > prev_time_end
         )
@@ -405,9 +406,29 @@ def recent_sessions_graph(
             TimeDifferences
         """,
         fetch_results=True,
-    )[0][0]  # type: ignore
+    )
 
-    similarity_threshold = client.execute_query(
+    if results is None or len(results) == 0:
+        raise Exception(
+            f"Could not determine the time_threshold for {context.partition_key}."
+        )
+
+    time_threshold = results[0][0]
+    context.log.info(f"{time_threshold = }")
+    return time_threshold
+
+
+@asset(
+    partitions_def=user_partitions_def,
+    deps=[recent_session_embeddings],
+)
+def similarity_threshold(
+    context: AssetExecutionContext,
+    pgvector: PGVectorClientResource,
+):
+    client = pgvector.get_client()
+    # Calculate the time and similarity thresholds for this user
+    results = client.execute_query(
         query=f"""
         WITH CosineSimilarities AS (
             SELECT
@@ -434,18 +455,132 @@ def recent_sessions_graph(
         FROM
             FilteredSimilarities""",
         fetch_results=True,
-    )[0][0]  # type: ignore
+    )
+
+    if results is None or len(results) == 0:
+        raise Exception(
+            f"Could not determine the similarity_threshold for {context.partition_key}."
+        )
+
+    similarity_threshold = results[0][0]
+    context.log.info(f"{similarity_threshold = }")
+    return similarity_threshold
+
+
+@asset(
+    partitions_def=user_partitions_def,
+    deps=[recent_session_embeddings],
+)
+def recent_sessions_merged(
+    context: AssetExecutionContext,
+    pgvector: PGVectorClientResource,
+    time_threshold,
+    similarity_threshold,
+):
+    client = pgvector.get_client()
 
     context.log.info(
         f"Time threshold: {time_threshold:.2f} seconds. "
         f"Embedding similarity threshold: {similarity_threshold:.4f}"
     )
 
-    # TODO: @Giovanni
+    # Create a copy of the sessions in the merged table (but first delete any
+    # existing rows for this user)
+    client.execute_query(
+        f"DELETE FROM recent_sessions_merged where user_id = '{context.partition_key}'"
+    )
+    client.execute_query(
+        query=f"""
+        INSERT INTO recent_sessions_merged 
+        SELECT *
+        FROM recent_session_embeddings 
+        WHERE user_id = '{context.partition_key}';
+        """
+    )
+
+    # TODO: Explore implementing this logic in Polars instead. The problems with
+    # the current logic are noted in Issue #4.
     #
-    # - I'm also including the `user_id`; otherwise, you'd be matching sessions
-    #   across users.
-    # - FilteredPairs2 is redundant and is the same as FilteredPairs1
+    # --------------------------------------------------------------------------
+    #
+    # TODO: Explore recomputing a new description and embedding for the merged
+    # session (or concatenating the description strings and finding the cluster
+    # mean of the embeddings of all the sessions that will be merged) as an
+    # alternative solution.
+    candidates_to_merge = client.execute_query(
+        query=f"""
+        SELECT 
+            a.id, 
+            b.id, 
+            1 - (a.embedding <=> b.embedding) AS similarity
+        FROM 
+            recent_sessions_merged a
+        JOIN 
+            recent_sessions_merged b 
+            ON
+                a.user_id = '{context.partition_key}'
+                AND a.user_id = b.user_id
+                AND a.id != b.id 
+                AND (
+                    b.date > a.date 
+                    OR (a.date = b.date AND b.time_start > a.time_end)
+                )
+        WHERE 
+            EXTRACT(
+                'epoch' FROM (
+                    (a.date || ' ' || a.time)::timestamp  
+                    - (b.date || ' ' || b.time)::timestamp)
+                ) 
+            ) <= {time_threshold}
+            AND
+            1 - (a.embedding <=> b.embedding) >= {similarity_threshold}""",
+        fetch_results=True,
+    )
+
+    for a, b in candidates_to_merge:  # type: ignore
+        # Update time_end of document a with the maximum time_end of both sessions
+        client.execute_query(
+            f"""
+            UPDATE recent_sessions_merged
+            SET time_end = (
+                SELECT 
+                    GREATEST(max_a.time_end, max_b.time_end)
+                FROM 
+                    (SELECT time_end FROM recent_sessions_merged WHERE id = {a}) as max_a,
+                    (SELECT time_end FROM recent_sessions_merged WHERE id = {b}) as max_b
+            )
+            WHERE id = {a}
+            """
+        )
+
+        # Update time_start of document a with the minimum time_start of both sessions
+        client.execute_query(
+            f"""
+            UPDATE recent_sessions_merged
+            SET time_start = (
+                SELECT 
+                    LEAST(min_a.time_start, min_b.time_start)
+                FROM 
+                    (SELECT time_start FROM recent_sessions_merged WHERE id = {a}) as min_a,
+                    (SELECT time_start FROM recent_sessions_merged WHERE id = {b}) as min_b
+            )
+            WHERE id = {a}
+            """
+        )
+        # Delete the duplicate session
+        client.execute_query(f"DELETE FROM recent_sessions_merged WHERE id = {b}")
+
+
+@asset(
+    partitions_def=user_partitions_def,
+    deps=[recent_sessions_merged],
+)
+def recent_sessions_graph(
+    context: AssetExecutionContext,
+    pgvector: PGVectorClientResource,
+    similarity_threshold,
+):
+    client = pgvector.get_client()
 
     # Cleanup existing data for this partition (i.e., user)
     client.execute_query(
@@ -466,17 +601,17 @@ def recent_sessions_graph(
                     a.time_end AS doc_time_end,
                 b.time_start AS compared_doc_time_start
             FROM
-                recent_session_embeddings a
+                recent_sessions_merged a
             JOIN
-                recent_session_embeddings b 
-                    ON
-                        a.user_id = '{context.partition_key}'
-                        AND a.user_id = b.user_id
-                        AND a.id != b.id 
-                        AND (
-                            b.date > a.date 
-                            OR (a.date = b.date AND b.time_start > a.time_end)
-                        )
+                recent_sessions_merged b 
+                ON
+                    a.user_id = '{context.partition_key}'
+                    AND a.user_id = b.user_id
+                    AND a.id != b.id 
+                    AND (
+                        b.date > a.date 
+                        OR (a.date = b.date AND b.time_start > a.time_end)
+                    )
         ),
 
         RankedPairs AS (
@@ -500,7 +635,7 @@ def recent_sessions_graph(
                 RankedPairs
             WHERE
                 rank = 1
-                    AND similarity > {similarity_threshold}
+                AND similarity > {similarity_threshold}
         )
 
         INSERT INTO recent_sessions_graph (user_id, parent_id, child_id, weight)
@@ -509,7 +644,6 @@ def recent_sessions_graph(
             user_id,
             doc_id,
             compared_doc_id,
-            /* distance = 1 - similarity */
             1 - similarity as distance
         FROM
             FilteredPairs1
