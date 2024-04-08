@@ -1,7 +1,12 @@
 from functools import partial
 
+import cuml
+import cupy as cp
+import numpy as np
 import polars as pl
+from cuml.metrics import pairwise_distances
 from dagster import AssetExecutionContext, asset
+from hdbscan import HDBSCAN
 from pydantic import Field
 from sentence_transformers import SentenceTransformer
 
@@ -107,3 +112,48 @@ def sensitive_interest_embeddings(
             partial(get_embeddings, model=model),
         )
     )
+
+
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+def sensitive_interest_clusters(
+    context: AssetExecutionContext,
+    config: RowLimitConfig,
+    sensitive_interest_embeddings: pl.DataFrame,
+) -> pl.DataFrame:
+    # Apply the row limit (if any)
+    df = sensitive_interest_embeddings.slice(0, config.row_limit)
+
+    # Convert the embeddings to a CuPy array
+    embeddings_gpu = cp.asarray(df["embeddings"].to_numpy())
+
+    # Reduce the embeddings dimensions
+    umap_model = cuml.UMAP(
+        n_neighbors=15, n_components=100, min_dist=0.1, metric="cosine"
+    )
+    reduced_data_gpu = umap_model.fit_transform(embeddings_gpu)
+
+    # TODO: Implement a search across cluster_selection_epsilon to ensure a max
+    # of 50 clusters are returned.
+
+    # Compute the pairwise distances between the interests
+    cosine_dist = pairwise_distances(reduced_data_gpu, metric="cosine")
+
+    # Make the clusters
+    clusterer = HDBSCAN(
+        min_cluster_size=5,
+        gen_min_span_tree=True,
+        metric="precomputed",
+        cluster_selection_epsilon=0.02,
+    )
+    cluster_labels = clusterer.fit_predict(cosine_dist.astype(np.float64).get())
+
+    context.add_output_metadata(
+        {
+            "num_clusters": len(np.unique(cluster_labels)),
+            "cluster_names": np.unique(cluster_labels).tolist(),
+        }
+    )
+
+    # TODO: Implement logic to extract the top 5 largest clusters, and top 5 clusters
+    # by farthest point sampling (most distance from each other -.e., cross-cluster distance)
+    return df.with_columns(cluster_label=pl.Series(cluster_labels))

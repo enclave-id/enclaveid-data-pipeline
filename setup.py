@@ -31,6 +31,10 @@ setup(
             "ruff",
             "vllm",
             "sentence-transformers",
+            "cupy-cuda12x",
+            "hdbscan",
         ]
     },
 )
+
+# pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12==24.2.*
