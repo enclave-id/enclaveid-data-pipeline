@@ -1,6 +1,9 @@
+from functools import partial
+
 import polars as pl
 from dagster import AssetExecutionContext, asset
 from pydantic import Field
+from sentence_transformers import SentenceTransformer
 
 from ..partitions import user_partitions_def
 from ..utils.custom_config import RowLimitConfig
@@ -70,3 +73,37 @@ def sensitive_interests(
     )
 
     return sessions_output.output_df
+
+
+def get_embeddings(series: pl.Series, model: SentenceTransformer):
+    embeddings = model.encode(series.to_list(), precision="float32")
+    return pl.Series(
+        name="embeddings",
+        values=embeddings,
+        dtype=pl.Array(pl.Float32, model.get_sentence_embedding_dimension()),  # type: ignore
+    )
+
+
+@asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
+def sensitive_interest_embeddings(
+    context: AssetExecutionContext,
+    config: RowLimitConfig,
+    sensitive_interests: pl.DataFrame,
+) -> pl.DataFrame:
+    df = (
+        # Enforce row_limit (if any)
+        sensitive_interests.slice(0, config.row_limit)
+        .select("date", "interests")
+        # Explode the interests so we get the embeddings for each individual interest
+        .explode("interests")
+    )
+
+    context.log.info("Loading model...")
+    model = SentenceTransformer("Salesforce/SFR-Embedding-Mistral")
+
+    context.log.info("Computing embeddings")
+    return df.with_columns(
+        embeddings=pl.col("interests").map_batches(
+            partial(get_embeddings, model=model),
+        )
+    )

@@ -29,6 +29,8 @@ setup(
             "ipykernel",
             "ipywidgets",
             "ruff",
+            "vllm",
+            "sentence-transformers",
         ]
     },
 )
