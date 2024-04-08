@@ -10,12 +10,6 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
 
-SUMMARY_PROMPT = (
-    "Here is a list of my Google search data. Are there any highly sensitive "
-    "psychosocial interests? Summarize the answer as a comma-separated array of "
-    "strings. Only include highly sensitive psychosocial data."
-)
-
 
 @dataclass
 class FullHistorySessionsOutput:
@@ -27,6 +21,8 @@ class FullHistorySessionsOutput:
 class DailyInterestsGenerator:
     date: datetime.date
     df: pl.DataFrame
+    prompt_prefix: str
+    prompt_suffix: str
     llm: LLM
     sampling_params: SamplingParams
     chunk_size: int = 15
@@ -58,7 +54,9 @@ class DailyInterestsGenerator:
                 fmt_str_lengths=max_chars,
                 tbl_rows=-1,
             ):
-                text = f"<s>[INST] {SUMMARY_PROMPT}\n\n{frame}[/INST]"
+                text = "<s>[INST] {}\n\n{}\n{}[/INST]".format(
+                    self.prompt_prefix, frame, self.prompt_suffix
+                )
                 prompts.append(text)
 
         self.chunked_prompts = prompts
@@ -67,7 +65,11 @@ class DailyInterestsGenerator:
         # TODO: We could potentially see a signifcant speedup by processing all
         # prompts at the same time, instead of daily, where batch sizes can be
         # rather small. This will raise some complexity with respect to mapping
-        # responses to their date.
+        # responses to their date. We could then potentially also compute the
+        # sensitive and general interests at the same time for a further speedup.
+        # -------------
+        # TODO: Experiment with prefix caching. See the example below.
+        # https://github.com/vllm-project/vllm/blob/main/examples/offline_inference_with_prefix.py
         output_requests = self.llm.generate(self.chunked_prompts, self.sampling_params)
         self.chunked_responses = [resp.outputs[0].text for resp in output_requests]
 
@@ -104,6 +106,8 @@ class DailyInterestsGenerator:
 def get_full_history_sessions(
     daily_dfs: dict[datetime.date, pl.DataFrame],
     chunk_size: int,
+    prompt_prefix: str,
+    prompt_suffix: str,
     logger: Logger,
     model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
 ):
@@ -119,6 +123,8 @@ def get_full_history_sessions(
         interests_generator = DailyInterestsGenerator(
             date=day,
             df=day_df,
+            prompt_prefix=prompt_prefix,
+            prompt_suffix=prompt_suffix,
             llm=llm,
             sampling_params=sampling_params,
             chunk_size=chunk_size,

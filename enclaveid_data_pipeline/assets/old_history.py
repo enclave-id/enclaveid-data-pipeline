@@ -36,7 +36,7 @@ class AllSessionsConfig(RowLimitConfig):
 
 
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
-def daily_interests(
+def sensitive_interests(
     context: AssetExecutionContext,
     config: AllSessionsConfig,
     full_takeout: pl.DataFrame,
@@ -52,7 +52,17 @@ def daily_interests(
     ).partition_by("date", as_dict=True, include_key=False)
 
     sessions_output = get_full_history_sessions(
-        daily_dfs=daily_dfs, chunk_size=config.chunk_size, logger=context.log
+        daily_dfs=daily_dfs,
+        chunk_size=config.chunk_size,
+        prompt_prefix=(
+            "Here is a list of my Google search data. Are there any highly sensitive "
+            "psychosocial interests?"
+        ),
+        prompt_suffix=(
+            "Summarize the answer as a comma-separated array of strings. Only "
+            "include highly sensitive psychosocial data."
+        ),
+        logger=context.log,
     )
 
     context.add_output_metadata(
