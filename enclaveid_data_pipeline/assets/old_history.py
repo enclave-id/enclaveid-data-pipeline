@@ -25,7 +25,7 @@ SUMMARY_PROMPT = (
 )
 
 
-class AllSessionsConfig(RowLimitConfig):
+class InterestsConfig(RowLimitConfig):
     model_name: str = Field(
         default="mistralai/Mistral-7B-Instruct-v0.2",
         description=(
@@ -33,6 +33,24 @@ class AllSessionsConfig(RowLimitConfig):
             "list of the support models:\n"
             "https://docs.vllm.ai/en/latest/models/supported_models.html"
         ),
+    )
+
+    chunk_size: int = Field(
+        default=15,
+        description=(
+            "Split the raw history into chunks of this size. We allow vLLM to "
+            "determine the ideal batch size by itsef, so this has no impact on "
+            "runtime but it still determines how many records are shown to the "
+            "LLM at one time. Having too many records can cause the LLM to give "
+            "sub-par responses."
+        ),
+    )
+
+
+class InterestsEmbeddingsConfig(RowLimitConfig):
+    model_name: str = Field(
+        default="Salesforce/SFR-Embedding-Mistral",
+        description=("The Hugging Face model to use with SentenceTransformers."),
     )
 
     chunk_size: int = Field(
@@ -59,7 +77,7 @@ def build_interests_assets(spec: InterestsSpec) -> list[AssetsDefinition]:
     )
     def interests(
         context: AssetExecutionContext,
-        config: AllSessionsConfig,
+        config: InterestsConfig,
         full_takeout: pl.DataFrame,
     ) -> pl.DataFrame:
         # Enforce the row_limit (if any) per day and sort the data by time because
@@ -94,7 +112,7 @@ def build_interests_assets(spec: InterestsSpec) -> list[AssetsDefinition]:
     )
     def interests_embeddings(
         context: AssetExecutionContext,
-        config: RowLimitConfig,
+        config: InterestsEmbeddingsConfig,
         interests: pl.DataFrame,
     ) -> pl.DataFrame:
         df = (
@@ -106,7 +124,7 @@ def build_interests_assets(spec: InterestsSpec) -> list[AssetsDefinition]:
         )
 
         context.log.info("Loading the model. This may take a few minutes...")
-        model = SentenceTransformer("Salesforce/SFR-Embedding-Mistral")
+        model = SentenceTransformer(config.model_name)
 
         context.log.info("Computing embeddings")
         return df.with_columns(
