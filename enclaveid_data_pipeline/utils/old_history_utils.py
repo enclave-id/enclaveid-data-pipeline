@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import gc
 import re
@@ -7,6 +8,7 @@ from typing import Any
 
 import polars as pl
 import torch
+from sentence_transformers import SentenceTransformer
 from vllm import LLM, SamplingParams
 from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
 
@@ -21,8 +23,8 @@ class FullHistorySessionsOutput:
 class DailyInterestsGenerator:
     date: datetime.date
     df: pl.DataFrame
-    prompt_prefix: str
-    prompt_suffix: str
+    first_instruction: str
+    second_instruction: str
     llm: LLM
     sampling_params: SamplingParams
     chunk_size: int = 15
@@ -36,17 +38,31 @@ class DailyInterestsGenerator:
         else:
             return None
 
-    def _generate_chunked_prompts(self):
+    def _generate_chunks(self):
         # Keep only the relevant columns
         filtered_df = self.df.select("hour", "title")
 
-        prompts: list[str] = []
-        for idx, frame in enumerate(
-            filtered_df.iter_slices(n_rows=self.chunk_size), start=1
-        ):
+        self.chunks: list[pl.DataFrame] = []
+        for frame in filtered_df.iter_slices(n_rows=self.chunk_size):
+            self.chunks.append(frame)
+
+    def _generate_chunked_interests(self):
+        """
+        TODO: We could potentially see a signifcant speedup by processing all
+        prompts at the same time, instead of daily, where batch sizes can be
+        rather small. This will raise some complexity with respect to mapping
+        responses to their date. We could then potentially also compute the
+        sensitive and general interests at the same time for a further speedup.
+
+        TODO: Experiment with prefix caching. See the example below.
+        https://github.com/vllm-project/vllm/blob/main/examples/offline_inference_with_prefix.py
+        """
+        first_prompts: list[str] = []
+        for idx, frame in enumerate(self.chunks, start=1):
             # Set Polars' string formatting so none of the rows or strings are
             # compressed / cut off.
             max_chars = frame["title"].str.len_chars().max()
+
             with pl.Config(
                 tbl_formatting="NOTHING",
                 tbl_hide_column_data_types=True,
@@ -54,33 +70,35 @@ class DailyInterestsGenerator:
                 fmt_str_lengths=max_chars,
                 tbl_rows=-1,
             ):
-                text = "<s>[INST] {}\n\n{}\n{}[/INST]".format(
-                    self.prompt_prefix, frame, self.prompt_suffix
+                first_prompts.append(
+                    "<s> [INST] {}\n\n{}\n [/INST]".format(
+                        self.first_instruction, frame
+                    )
                 )
-                prompts.append(text)
 
-        self.chunked_prompts = prompts
+        first_requests = self.llm.generate(first_prompts, self.sampling_params)
+        first_responses = [resp.outputs[0].text for resp in first_requests]
 
-    def _generate_chunked_responses(self):
-        # TODO: We could potentially see a signifcant speedup by processing all
-        # prompts at the same time, instead of daily, where batch sizes can be
-        # rather small. This will raise some complexity with respect to mapping
-        # responses to their date. We could then potentially also compute the
-        # sensitive and general interests at the same time for a further speedup.
-        # -------------
-        # TODO: Experiment with prefix caching. See the example below.
-        # https://github.com/vllm-project/vllm/blob/main/examples/offline_inference_with_prefix.py
-        output_requests = self.llm.generate(self.chunked_prompts, self.sampling_params)
-        self.chunked_responses = [resp.outputs[0].text for resp in output_requests]
+        second_prompts: list[str] = []
+        for p1, r1 in zip(first_prompts, first_responses):
+            second_prompts.append(
+                f"{p1} {r1}</s> [INST] {self.second_instruction} [/INST]"
+            )
 
-    def _generate_chunked_interests(self):
+        second_requests = self.llm.generate(second_prompts, self.sampling_params)
+        second_responses = [resp.outputs[0].text for resp in second_requests]
+
         self.chunked_interests = [
-            self._extract_interests_list(resp) for resp in self.chunked_responses
+            self._extract_interests_list(resp) for resp in second_responses
         ]
 
+        # Save the convo for each chunk as a single string
+        self.chunked_convos = []
+        for p2, r2 in zip(second_prompts, second_responses):
+            self.chunked_convos.append(f"{p2} {r2}</s>")
+
     def generate_output_record(self):
-        self._generate_chunked_prompts()
-        self._generate_chunked_responses()
+        self._generate_chunks()
         self._generate_chunked_interests()
 
         # Filter out invalid responses
@@ -91,14 +109,13 @@ class DailyInterestsGenerator:
 
         return {
             "date": self.date,
-            "chunked_prompts": self.chunked_prompts,
-            "chunked_responses": self.chunked_responses,
+            "chunked_convos": self.chunked_convos,
             "chunked_interests": self.chunked_interests,
             # Different chunks may have the same interests; we only want the
             # distinct interests across all chunks
             "interests": list(set(merged_interests)),
             "count_invalid_responses": (
-                len(self.chunked_responses) - len(valid_chunks)
+                len(self.chunked_interests) - len(valid_chunks)
             ),
         }
 
@@ -106,11 +123,12 @@ class DailyInterestsGenerator:
 def get_full_history_sessions(
     daily_dfs: dict[datetime.date, pl.DataFrame],
     chunk_size: int,
-    prompt_prefix: str,
-    prompt_suffix: str,
+    first_instruction: str,
+    second_instruction: str,
     logger: Logger,
     model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
 ):
+    logger.info("Loading the model. This may take a few minutes...")
     llm = LLM(model=model_name)
 
     # TODO: We could potentially make this part of the Config so the params can be
@@ -123,8 +141,8 @@ def get_full_history_sessions(
         interests_generator = DailyInterestsGenerator(
             date=day,
             df=day_df,
-            prompt_prefix=prompt_prefix,
-            prompt_suffix=prompt_suffix,
+            first_instruction=first_instruction,
+            second_instruction=second_instruction,
             llm=llm,
             sampling_params=sampling_params,
             chunk_size=chunk_size,
@@ -146,4 +164,13 @@ def get_full_history_sessions(
         count_invalid_responses=sum(
             out["count_invalid_responses"] for out in daily_records
         ),
+    )
+
+
+def get_embeddings(series: pl.Series, model: SentenceTransformer):
+    embeddings = model.encode(series.to_list(), precision="float32")
+    return pl.Series(
+        name="embeddings",
+        values=embeddings,
+        dtype=pl.Array(pl.Float32, model.get_sentence_embedding_dimension()),  # type: ignore
     )

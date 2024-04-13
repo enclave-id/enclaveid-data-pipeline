@@ -12,7 +12,7 @@ from sentence_transformers import SentenceTransformer
 
 from ..partitions import user_partitions_def
 from ..utils.custom_config import RowLimitConfig
-from ..utils.old_history_utils import get_full_history_sessions
+from ..utils.old_history_utils import get_embeddings, get_full_history_sessions
 
 SUMMARY_PROMPT = (
     "Here is a list of my Google search data. Are there any highly sensitive "
@@ -62,13 +62,13 @@ def sensitive_interests(
     sessions_output = get_full_history_sessions(
         daily_dfs=daily_dfs,
         chunk_size=config.chunk_size,
-        prompt_prefix=(
+        first_instruction=(
             "Here is a list of my Google search data. Are there any highly sensitive "
             "psychosocial interests?"
         ),
-        prompt_suffix=(
-            "Summarize the answer as a comma-separated array of strings. Only "
-            "include highly sensitive psychosocial data."
+        second_instruction=(
+            "Summarize the previous answer as a comma-separated array of strings. "
+            "Only include highly sensitive psychosocial data."
         ),
         logger=context.log,
     )
@@ -78,15 +78,6 @@ def sensitive_interests(
     )
 
     return sessions_output.output_df
-
-
-def get_embeddings(series: pl.Series, model: SentenceTransformer):
-    embeddings = model.encode(series.to_list(), precision="float32")
-    return pl.Series(
-        name="embeddings",
-        values=embeddings,
-        dtype=pl.Array(pl.Float32, model.get_sentence_embedding_dimension()),  # type: ignore
-    )
 
 
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
@@ -103,7 +94,7 @@ def sensitive_interest_embeddings(
         .explode("interests")
     )
 
-    context.log.info("Loading model...")
+    context.log.info("Loading the model. This may take a few minutes...")
     model = SentenceTransformer("Salesforce/SFR-Embedding-Mistral")
 
     context.log.info("Computing embeddings")
