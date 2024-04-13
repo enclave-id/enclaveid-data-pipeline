@@ -17,7 +17,7 @@ setup(
         "pgvector",
         "psycopg[binary]",
         "pyarrow",
-        "skypilot[azure]",
+        # "skypilot[azure]",
         "tqdm",
         "universal_pathlib",
     ],
@@ -29,7 +29,7 @@ setup(
             "ipykernel",
             "ipywidgets",
             "ruff",
-            "vllm",
+            "vllm>=0.4.0",
             "sentence-transformers",
             "cupy-cuda12x",
             "hdbscan",
@@ -37,4 +37,5 @@ setup(
     },
 )
 
+# Additionally, run the following to install cuml
 # pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12==24.2.*
