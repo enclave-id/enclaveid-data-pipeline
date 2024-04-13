@@ -1,4 +1,3 @@
-import dataclasses
 import datetime
 import gc
 import re
@@ -8,9 +7,16 @@ from typing import Any
 
 import polars as pl
 import torch
+from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from vllm import LLM, SamplingParams
 from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
+
+
+class InterestsSpec(BaseModel):
+    name_prefix: str = Field(description="A prefix to add to the name of the asset.")
+    first_instruction: str
+    second_instruction: str
 
 
 @dataclass
