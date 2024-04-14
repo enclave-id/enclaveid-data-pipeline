@@ -184,3 +184,50 @@ async def get_daily_sessions(
         invalid_times=invalid_times,
         invalid_sessions=invalid_types + invalid_keys + invalid_times,
     )
+
+
+async def get_chunk_embedding(
+    texts: list[str], client: MistralAsyncClient, model: str, limiter: AsyncLimiter
+) -> list[list[float]]:
+    async with limiter:
+        response = await client.embeddings(
+            model=model,
+            input=texts,
+        )
+
+    return [x.embedding for x in response.data]
+
+
+# TODO: Consider making this a method of the MistralResource.
+async def get_embeddings(
+    texts: pl.Series,
+    client: MistralAsyncClient,
+    batch_size: int,
+    logger: DagsterLogManager,
+    rate_limit: float,
+    model: str,
+) -> pl.Series:
+    """
+    Parameters
+    ---
+    rate_limit
+        the maximum requests allowed **per second**
+    """
+    limiter = AsyncLimiter(max_rate=rate_limit, time_period=1)
+
+    embeddings = []
+    tasks = []
+    for idx in range(0, len(texts), batch_size):
+        tasks.append(
+            get_chunk_embedding(
+                texts=texts.slice(idx, batch_size).to_list(),
+                client=client,
+                model=model,
+                limiter=limiter,
+            )
+        )
+
+    chunk_responses = await asyncio.gather(*tasks)
+    embeddings = [emb for chunk in chunk_responses for emb in chunk]
+
+    return pl.Series(embeddings, dtype=pl.Array(pl.Float64, 1024))
