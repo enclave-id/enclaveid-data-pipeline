@@ -1,4 +1,5 @@
 from dagster import ConfigurableResource
+from mistralai.async_client import MistralAsyncClient
 from mistralai.client import MistralClient
 from pydantic import Field
 
@@ -8,3 +9,6 @@ class MistralResource(ConfigurableResource):
 
     def get_client(self) -> MistralClient:
         return MistralClient(api_key=self.api_key)
+
+    def get_async_client(self) -> MistralAsyncClient:
+        return MistralAsyncClient(api_key=self.api_key)

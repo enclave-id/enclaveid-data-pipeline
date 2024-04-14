@@ -1,12 +1,10 @@
 import math
 import os
-from functools import partial
 from textwrap import dedent
 
 import polars as pl
 import psycopg
-from dagster import AssetExecutionContext, DagsterLogManager, asset
-from mistralai.client import MistralClient
+from dagster import AssetExecutionContext, asset
 from pgvector.psycopg import register_vector
 from pydantic import Field
 
@@ -14,7 +12,11 @@ from ..partitions import user_partitions_def
 from ..resources.mistral_resource import MistralResource
 from ..resources.postgres_resource import PGVectorClient, PGVectorClientResource
 from ..utils.custom_config import RowLimitConfig
-from ..utils.recent_history_utils import ChunkedSessionOutput, get_daily_sessions
+from ..utils.recent_history_utils import (
+    ChunkedSessionOutput,
+    get_daily_sessions,
+    get_embeddings,
+)
 
 # TODO: Avoid auto-committing queries and bundle them as one transaction,
 # where appropriate.
@@ -44,12 +46,26 @@ SUMMARY_PROMPT = dedent("""
 
 class SessionsConfig(RowLimitConfig):
     chunk_size: int = Field(default=15, description="The size of each chunk.")
+    model_name: str = Field(
+        default="mistral-tiny",
+        description=(
+            "The Mistral model to use. See the Mistral docs for a list of valid "
+            "endpoints: https://docs.mistral.ai/platform/endpoints/"
+        ),
+    )
+    rate_limit: float = Field(
+        default=5.0,
+        description=(
+            "The maximum number of requests allowed per second. See the Mistral "
+            "docs here: https://docs.mistral.ai/platform/pricing/"
+        ),
+    )
 
 
 # TODO: Consider converting all these assets into a single graph-backed asset
 # called recent_sessions.
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
-def recent_sessions(
+async def recent_sessions(
     context: AssetExecutionContext,
     config: SessionsConfig,
     mistral: MistralResource,
@@ -58,7 +74,7 @@ def recent_sessions(
     # Enforce the row_limit (if any) per day
     recent_takeout = recent_takeout.slice(0, config.row_limit)
 
-    client = mistral.get_client()
+    client = mistral.get_async_client()
 
     # Sort the data by time -- Polars might read data out-of-order
     recent_sessions = recent_takeout.sort("timestamp")
@@ -69,14 +85,24 @@ def recent_sessions(
         date=pl.col("timestamp").dt.date()
     ).partition_by("date", as_dict=True, include_key=False)
 
-    # TODO: Make this (and the calls inside get_daily_sessions) async/concurrent.
     daily_outputs: list[ChunkedSessionOutput] = []
-    for day, day_df in daily_dfs.items():
-        daily_outputs.append(
-            get_daily_sessions(
-                day_df, client, config.chunk_size, context.log, day, SUMMARY_PROMPT
-            )
+    for idx, (day, day_df) in enumerate(daily_dfs.items(), start=1):
+        num_chunks = math.ceil(day_df.height / config.chunk_size)
+        context.log.info(
+            f"Processing {num_chunks} chunks for {day} ({idx} / {len(daily_dfs)})"
         )
+
+        output = await get_daily_sessions(
+            df=day_df,
+            client=client,
+            chunk_size=config.chunk_size,
+            logger=context.log,
+            day=day,
+            prompt=SUMMARY_PROMPT,
+            rate_limit=config.rate_limit,
+            model=config.model_name,
+        )
+        daily_outputs.append(output)
 
     context.add_output_metadata(
         {
@@ -94,26 +120,6 @@ def recent_sessions(
     )
 
     return pl.concat((out.output_df for out in daily_outputs))
-
-
-# TODO: Consider making this a method of the MistralResource.
-def get_embeddings(
-    texts: pl.Series, client: MistralClient, chunk_size: int, logger: DagsterLogManager
-) -> pl.Series:
-    # TODO: Maybe we want to make this async?
-    num_chunks = math.ceil(len(texts) / chunk_size)
-    embeddings = []
-    for idx in range(0, len(texts), chunk_size):
-        logger.info(f"Processing chunk {int(idx/chunk_size) + 1} / {num_chunks}")
-
-        response = client.embeddings(
-            model="mistral-embed",
-            input=texts.slice(idx, chunk_size).to_list(),
-        )
-
-        embeddings.extend(x.embedding for x in response.data)
-
-    return pl.Series(embeddings, dtype=pl.Array(pl.Float64, 1024))
 
 
 # TODO: Consider encapsulating this logic in an IOManager and/or moving the binary
@@ -173,7 +179,29 @@ def upload_embeddings(
 
 
 class SessionEmbeddingsConfig(RowLimitConfig):
-    chunk_size: int = Field(default=100, description="The size of each chunk.")
+    batch_size: int = Field(
+        default=100,
+        description=(
+            "Mistral allows passing a batch of multiple strings to the embeddings "
+            "endpoint as a single request, maximising throughput. However, a "
+            "single batch can only have a maximum  of 16,384 tokens. Reduce the "
+            "batch size if the API returns a 'Too many tokens in batch.' error"
+        ),
+    )
+    model_name: str = Field(
+        default="mistral-embed",
+        description=(
+            "The Mistral model to use. See the Mistral docs for a list of valid "
+            "endpoints: https://docs.mistral.ai/platform/endpoints/"
+        ),
+    )
+    rate_limit: float = Field(
+        default=5.0,
+        description=(
+            "The maximum number of requests allowed per second. See the Mistral "
+            "docs here: https://docs.mistral.ai/platform/pricing/"
+        ),
+    )
 
 
 # TODO: Consider incorporate this logic inside recent_sessions.
@@ -181,7 +209,7 @@ class SessionEmbeddingsConfig(RowLimitConfig):
     partitions_def=user_partitions_def,
     io_manager_key="parquet_io_manager",
 )
-def recent_session_embeddings(
+async def recent_session_embeddings(
     context: AssetExecutionContext,
     config: SessionEmbeddingsConfig,
     mistral: MistralResource,
@@ -191,17 +219,21 @@ def recent_session_embeddings(
     # Enforce row_limit (if any)
     recent_sessions = recent_sessions.slice(0, config.row_limit)
 
-    context.log.info("Getting embeddings...")
-    client = mistral.get_client()
+    num_chunks = math.ceil(len(recent_sessions) / config.batch_size)
+    context.log.info(f"Getting embeddings for {num_chunks} chunks...")
+
+    client = mistral.get_async_client()
+    embeddings = await get_embeddings(
+        texts=recent_sessions.get_column("description"),
+        client=client,
+        batch_size=config.batch_size,
+        logger=context.log,
+        rate_limit=config.rate_limit,
+        model=config.model_name,
+    )
+
     recent_sessions = recent_sessions.with_columns(
-        embedding=pl.col("description").map_batches(
-            partial(
-                get_embeddings,
-                client=client,
-                chunk_size=config.chunk_size,
-                logger=context.log,
-            )
-        ),
+        embedding=embeddings,
         user_id=pl.lit(context.partition_key),
     )
 
