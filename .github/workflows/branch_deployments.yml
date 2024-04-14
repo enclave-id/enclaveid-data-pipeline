@@ -23,7 +23,7 @@ env:
 jobs:
   dagster_cloud_default_deploy:
     name: Dagster Serverless Deploy
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     outputs:
       build_info: ${{ steps.parse-workspace.outputs.build_info }}
     
@@ -58,7 +58,7 @@ jobs:
 
   dagster_cloud_docker_deploy:
     name: Docker Deploy
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     if: needs.dagster_cloud_default_deploy.outputs.build_info
     needs: dagster_cloud_default_deploy
     strategy:
@@ -66,6 +66,15 @@ jobs:
       matrix:
         location: ${{ fromJSON(needs.dagster_cloud_default_deploy.outputs.build_info) }}
     steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 512
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-docker-images: 'true'
       - name: Checkout
         uses: actions/checkout@v3
         with:
