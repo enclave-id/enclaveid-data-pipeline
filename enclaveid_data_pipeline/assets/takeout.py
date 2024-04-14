@@ -1,6 +1,5 @@
 from textwrap import dedent
 
-import pandas as pd
 import polars as pl
 from dagster import (
     AssetExecutionContext,
@@ -55,13 +54,12 @@ def parsed_takeout(
     if not config.threshold.startswith("-"):
         raise ValueError("the `threshold` should always start with a `-` sign.")
 
-    f = PRODUCTION_STORAGE_BUCKET / context.partition_key / "MyActivity.json"
+    p = PRODUCTION_STORAGE_BUCKET / context.partition_key / "MyActivity.json"
 
-    # TODO: Temporarily using Pandas to read the JSON because Polars doesn't
-    # play well with UPath. Will fix this later.
-    full_df = pl.from_pandas(
-        pd.read_json(f), schema_overrides={"time": pl.Datetime}
-    ).select(
+    with p.open("rb") as f:
+        raw_df = pl.read_json(f.read(), schema_overrides={"time": pl.Datetime})
+
+    full_df = raw_df.select(
         pl.all().exclude("time"),
         timestamp=pl.col("time"),
         date=pl.col("time").dt.date(),
