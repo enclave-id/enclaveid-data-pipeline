@@ -44,12 +44,26 @@ SUMMARY_PROMPT = dedent("""
 
 class SessionsConfig(RowLimitConfig):
     chunk_size: int = Field(default=15, description="The size of each chunk.")
+    model_name: str = Field(
+        default="mistral-tiny",
+        description=(
+            "The Mistral model to use. See the Mistral docs for a list of valid "
+            "endpoints: https://docs.mistral.ai/platform/endpoints/"
+        ),
+    )
+    rate_limit: float = Field(
+        default=5.0,
+        description=(
+            "The maximum number of requests allowed per second. See the Mistral "
+            "docs here: https://docs.mistral.ai/platform/pricing/"
+        ),
+    )
 
 
 # TODO: Consider converting all these assets into a single graph-backed asset
 # called recent_sessions.
 @asset(partitions_def=user_partitions_def, io_manager_key="parquet_io_manager")
-def recent_sessions(
+async def recent_sessions(
     context: AssetExecutionContext,
     config: SessionsConfig,
     mistral: MistralResource,
@@ -58,7 +72,7 @@ def recent_sessions(
     # Enforce the row_limit (if any) per day
     recent_takeout = recent_takeout.slice(0, config.row_limit)
 
-    client = mistral.get_client()
+    client = mistral.get_async_client()
 
     # Sort the data by time -- Polars might read data out-of-order
     recent_sessions = recent_takeout.sort("timestamp")
@@ -69,14 +83,24 @@ def recent_sessions(
         date=pl.col("timestamp").dt.date()
     ).partition_by("date", as_dict=True, include_key=False)
 
-    # TODO: Make this (and the calls inside get_daily_sessions) async/concurrent.
     daily_outputs: list[ChunkedSessionOutput] = []
-    for day, day_df in daily_dfs.items():
-        daily_outputs.append(
-            get_daily_sessions(
-                day_df, client, config.chunk_size, context.log, day, SUMMARY_PROMPT
-            )
+    for idx, (day, day_df) in enumerate(daily_dfs.items(), start=1):
+        num_chunks = math.ceil(day_df.height / config.chunk_size)
+        context.log.info(
+            f"Processing {num_chunks} chunks for {day} ({idx} / {len(daily_dfs)})"
         )
+
+        output = await get_daily_sessions(
+            df=day_df,
+            client=client,
+            chunk_size=config.chunk_size,
+            logger=context.log,
+            day=day,
+            prompt=SUMMARY_PROMPT,
+            rate_limit=config.rate_limit,
+            model=config.model_name,
+        )
+        daily_outputs.append(output)
 
     context.add_output_metadata(
         {

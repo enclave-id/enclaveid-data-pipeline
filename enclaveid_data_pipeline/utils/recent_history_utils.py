@@ -1,11 +1,12 @@
+import asyncio
 import datetime
 import json
-import math
 from dataclasses import dataclass
 
 import polars as pl
+from aiolimiter import AsyncLimiter
 from dagster import DagsterLogManager
-from mistralai.client import MistralClient
+from mistralai.async_client import MistralAsyncClient
 from mistralai.models.chat_completion import ChatMessage
 
 
@@ -65,35 +66,41 @@ def extract_json(text):
 
 
 # TODO: Consider making this a method of the MistralResource.
-def get_completion(prompt, client: MistralClient, model="mistral-tiny"):
+async def get_completion(
+    prompt: str, client: MistralAsyncClient, limiter: AsyncLimiter, model="mistral-tiny"
+):
     messages = [ChatMessage(role="user", content=prompt)]
-
-    chat_response = client.chat(
-        model=model,
-        messages=messages,
-    )
+    async with limiter:
+        chat_response = await client.chat(
+            model=model,
+            messages=messages,
+        )
 
     return chat_response.choices[0].message.content
 
 
-def get_daily_sessions(
+async def get_daily_sessions(
     df: pl.DataFrame,
-    client: MistralClient,
+    client: MistralAsyncClient,
     chunk_size: int,
     logger: DagsterLogManager,
     day: datetime.date,
     prompt: str,
+    rate_limit: float,
+    model: str = "mistral-tiny",
 ) -> ChunkedSessionOutput:
+    """
+    Parameters
+    ---
+    rate_limit
+        the maximum requests allowed per second
+    """
+    # Keep only the relevant columns
     df = df.select("hour", "title")
-    num_chunks = math.ceil(df.height / chunk_size)
 
-    raw_answers = []
-    sessions_list = []
-
-    # TODO: Make this async / concurrent.
+    limiter = AsyncLimiter(max_rate=rate_limit, time_period=1)
+    tasks = []
     for idx, frame in enumerate(df.iter_slices(n_rows=chunk_size), start=1):
-        logger.info(f"[{day}]  Processing chunk {idx} / {num_chunks}")
-
         # Set Polars' string formatting so none of the rows or strings are
         # compressed / cut off.
         max_chars = frame["title"].str.len_chars().max()
@@ -104,9 +111,18 @@ def get_daily_sessions(
             fmt_str_lengths=max_chars,
             tbl_rows=-1,
         ):
-            answer = get_completion(f"{prompt}\n{frame}", client)
-            raw_answers.append(answer)
+            tasks.append(
+                get_completion(
+                    prompt=f"{prompt}\n{frame}",
+                    client=client,
+                    limiter=limiter,
+                    model=model,
+                )
+            )
 
+    sessions_list = []
+    raw_answers = await asyncio.gather(*tasks)
+    for answer in raw_answers:
         # Sometimes the LLM returns multipe json objects in a list
         # Some other times it returns a single json object
         # We need to handle both cases

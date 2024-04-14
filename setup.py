@@ -5,6 +5,7 @@ setup(
     packages=find_packages(exclude=["enclaveid_data_pipeline_tests"]),
     install_requires=[
         "adlfs",
+        "aiolimiter",
         "dagster>=1.6.0,<1.7.0",
         "dagster-cloud",
         "dagster-polars",
