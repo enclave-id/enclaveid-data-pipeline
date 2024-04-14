@@ -21,6 +21,10 @@ setup(
         # "skypilot[azure]",
         "tqdm",
         "universal_pathlib",
+        "vllm>=0.4.0",
+        "sentence-transformers",
+        "cupy-cuda12x",
+        "hdbscan",
     ],
     extras_require={
         "dev": [
@@ -30,10 +34,6 @@ setup(
             "ipykernel",
             "ipywidgets",
             "ruff",
-            "vllm>=0.4.0",
-            "sentence-transformers",
-            "cupy-cuda12x",
-            "hdbscan",
         ]
     },
 )
